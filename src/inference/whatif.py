@@ -25,20 +25,17 @@ from torch_geometric.data import Data
 
 from ..models.physarum_gcn import PhysarumGCN, load_model
 from ..utils.config import (
-    inference_config, paths_config, data_config, NODE_TYPES
+    inference_config, model_config, paths_config, data_config, NODE_TYPES
 )
-from ..data.graph_builder import find_node, get_val, safe_float, safe_bool
+from ..data.graph_builder import (
+    find_node, get_val, safe_float, safe_bool,
+    COC_ALIGNMENT_THRESHOLD_PCT, TIMELINE_NORMAL_MAX_DAYS,
+    TIMELINE_NORMALISATION_DAYS, DEFAULT_DAYS_MISSING,
+)
 
-
-# Node type mapping (must match training)
-NODE_TYPE_KEYS = {
-    'CASE_START': 0, 'FC_PSU_BANK': 1, 'FC_PRIVATE_BANK': 2, 'FC_NBFC': 3,
-    'FC_ARC': 4, 'FC_OTHER': 5, 'OC_POOL': 6, 'COC_ALIGNED': 7,
-    'COC_FRAGMENTED': 8, 'PROMOTER_COOPERATIVE': 9, 'PROMOTER_HOSTILE': 10,
-    'PROMOTER_29A_ELIGIBLE': 11, 'PROMOTER_29A_BLOCKED': 12,
-    'TIMELINE_NORMAL': 13, 'TIMELINE_EXTENDED': 14,
-    'RESOLUTION_STRATEGIC': 15, 'RESOLUTION_PROMOTER': 16, 'LIQUIDATION': 17,
-}
+# NODE_TYPES is the authoritative mapping defined in config.py.
+# It is re-aliased here for clarity within this module.
+NODE_TYPE_KEYS = NODE_TYPES
 
 
 def build_graph_from_case(case_json: Dict) -> Data:
@@ -51,11 +48,12 @@ def build_graph_from_case(case_json: Dict) -> Data:
     Returns:
         PyG Data object
     """
-    # Extract nodes
-    n1 = find_node(case_json, ['node_1', 'case_profile', 'profile'])
-    n2 = find_node(case_json, ['node_2', 'creditor', 'financial', 'dynamics'])
-    n3 = find_node(case_json, ['node_3', 'promoter', 'behavior'])
-    n4 = find_node(case_json, ['node_4', 'timeline', 'capital'])
+    # Locate the four logical sections of the case JSON.
+    # Multiple key names are tried to handle schema variation across extraction runs.
+    case_profile = find_node(case_json, ['node_1', 'case_profile', 'profile'])
+    creditor_data = find_node(case_json, ['node_2', 'creditor', 'financial', 'dynamics'])
+    promoter_data = find_node(case_json, ['node_3', 'promoter', 'behavior'])
+    timeline_data = find_node(case_json, ['node_4', 'timeline', 'capital'])
     
     nodes = ['CASE_START']
     edges = []
@@ -64,14 +62,14 @@ def build_graph_from_case(case_json: Dict) -> Data:
     creditor_buckets = {}
     total_claims = 0.0
     
-    # Financial creditors
-    fc = get_val(n2.get('financial_creditors'))
+    # Financial creditors — aggregate claims by creditor type
+    fc = get_val(creditor_data.get('financial_creditors'))
     if isinstance(fc, list):
         for creditor in fc:
             if isinstance(creditor, dict):
                 ctype = str(creditor.get('type', '')).lower()
                 amount = safe_float(
-                    creditor.get('amount_crores') or 
+                    creditor.get('amount_crores') or
                     creditor.get('amount')
                 )
                 if amount > 0:
@@ -85,19 +83,19 @@ def build_graph_from_case(case_json: Dict) -> Data:
                         node_type = 'FC_ARC'
                     else:
                         node_type = 'FC_OTHER'
-                    
+
                     creditor_buckets[node_type] = creditor_buckets.get(node_type, 0) + amount
                     total_claims += amount
-    
-    # Operational creditors
-    oc_amount = safe_float(get_val(n2.get('operational_claims_total_crores')))
+
+    # Operational creditors are pooled into a single OC_POOL node
+    oc_amount = safe_float(get_val(creditor_data.get('operational_claims_total_crores')))
     if oc_amount > 0:
         creditor_buckets['OC_POOL'] = oc_amount
         total_claims += oc_amount
-    
-    # Fallback
+
+    # Fallback: use aggregate claim total if per-creditor breakdown is missing
     if total_claims == 0:
-        total_claims = safe_float(get_val(n2.get('total_admitted_claims')))
+        total_claims = safe_float(get_val(creditor_data.get('total_admitted_claims')))
         if total_claims > 0:
             creditor_buckets['FC_OTHER'] = total_claims
     
@@ -105,61 +103,72 @@ def build_graph_from_case(case_json: Dict) -> Data:
         creditor_buckets['FC_OTHER'] = 0
         total_claims = 1.0
     
-    for c_node, amount in creditor_buckets.items():
-        nodes.append(c_node)
+    for creditor_node, amount in creditor_buckets.items():
+        nodes.append(creditor_node)
+        # Edge weight = creditor's proportional claim share (minimum 0.01)
         weight = amount / total_claims if total_claims > 0 else 0.1
-        edges.append(('CASE_START', c_node, max(0.01, weight)))
-    
-    # CoC
-    top_share = safe_float(get_val(n2.get('coc_voting_share_top_creditor_pct')))
-    coc_node = 'COC_ALIGNED' if top_share > 40 else 'COC_FRAGMENTED'
+        edges.append(('CASE_START', creditor_node, max(0.01, weight)))
+
+    # CoC node — top-creditor share > 40% means one party controls the vote
+    top_share = safe_float(get_val(creditor_data.get('coc_voting_share_top_creditor_pct')))
+    coc_node = 'COC_ALIGNED' if top_share > COC_ALIGNMENT_THRESHOLD_PCT else 'COC_FRAGMENTED'
     nodes.append(coc_node)
-    
-    for c_node in creditor_buckets:
-        edges.append((c_node, coc_node, 1.0))
-    
-    # Promoter
-    is_coop = safe_bool(get_val(n3.get('promoter_cooperating_with_rp')))
-    submitted = safe_bool(get_val(n3.get('promoter_submitted_resolution_plan')))
-    promo_node = 'PROMOTER_COOPERATIVE' if (is_coop is True or submitted is True) else 'PROMOTER_HOSTILE'
-    
-    is_ineligible = safe_bool(get_val(n3.get('promoter_is_section_29a_ineligible')))
-    elig_node = 'PROMOTER_29A_BLOCKED' if is_ineligible is True else 'PROMOTER_29A_ELIGIBLE'
-    
-    nodes.extend([promo_node, elig_node])
-    edges.append((coc_node, promo_node, 1.0))
-    edges.append((promo_node, elig_node, 1.0))
-    
-    # Timeline
-    days = safe_float(get_val(n4.get('total_days_in_process')))
+    for creditor_node in creditor_buckets:
+        edges.append((creditor_node, coc_node, 1.0))
+
+    # Promoter nodes — behaviour and Section 29A eligibility are separate axes
+    is_cooperative = safe_bool(get_val(promoter_data.get('promoter_cooperating_with_rp')))
+    submitted_plan = safe_bool(get_val(promoter_data.get('promoter_submitted_resolution_plan')))
+    promoter_behavior_node = (
+        'PROMOTER_COOPERATIVE'
+        if (is_cooperative is True or submitted_plan is True)
+        else 'PROMOTER_HOSTILE'
+    )
+
+    is_ineligible = safe_bool(get_val(promoter_data.get('promoter_is_section_29a_ineligible')))
+    promoter_eligibility_node = (
+        'PROMOTER_29A_BLOCKED' if is_ineligible is True else 'PROMOTER_29A_ELIGIBLE'
+    )
+
+    nodes.extend([promoter_behavior_node, promoter_eligibility_node])
+    edges.append((coc_node, promoter_behavior_node, 1.0))
+    edges.append((promoter_behavior_node, promoter_eligibility_node, 1.0))
+
+    # Timeline node — 330 days separates within-window from substantially delayed cases
+    days = safe_float(get_val(timeline_data.get('total_days_in_process')))
     if days == 0:
-        days = 400.0
-    
-    time_node = 'TIMELINE_NORMAL' if days < 330 else 'TIMELINE_EXTENDED'
-    nodes.append(time_node)
-    edges.append((elig_node, time_node, 1.0))
-    
-    # Outcomes
+        days = DEFAULT_DAYS_MISSING  # dataset median when field is missing
+
+    timeline_node = 'TIMELINE_NORMAL' if days < TIMELINE_NORMAL_MAX_DAYS else 'TIMELINE_EXTENDED'
+    nodes.append(timeline_node)
+    edges.append((promoter_eligibility_node, timeline_node, 1.0))
+
+    # Outcome nodes — equal weights (0.33 each); the prediction comes from graph structure
     nodes.extend(['RESOLUTION_STRATEGIC', 'RESOLUTION_PROMOTER', 'LIQUIDATION'])
-    edges.append((time_node, 'RESOLUTION_STRATEGIC', 0.33))
-    edges.append((time_node, 'RESOLUTION_PROMOTER', 0.33))
-    edges.append((time_node, 'LIQUIDATION', 0.33))
-    
-    # Features
+    edges.append((timeline_node, 'RESOLUTION_STRATEGIC', 0.33))
+    edges.append((timeline_node, 'RESOLUTION_PROMOTER', 0.33))
+    edges.append((timeline_node, 'LIQUIDATION', 0.33))
+
+    # Node features (22-dim): 18 one-hot type dims + 4 continuous case-level dims
+    process_type = str(get_val(case_profile.get('process_type')) or "").lower()
+    company_size = str(get_val(case_profile.get('company_size')) or "").lower()
+
+    feat_is_ppirp = 1.0 if "ppirp" in process_type else 0.0       # dim 18
+    feat_is_msme = 1.0 if "msme" in company_size else 0.0          # dim 19
+    feat_log_claims = np.log1p(total_claims) / 10.0                 # dim 20
+    feat_timeline_urgency = max(0.1, 1.0 - (days / TIMELINE_NORMALISATION_DAYS))  # dim 21
+
     node_features = []
-    p_type = str(get_val(n1.get('process_type')) or "").lower()
-    c_size = str(get_val(n1.get('company_size')) or "").lower()
-    
-    f_process = 1.0 if "ppirp" in p_type else 0.0
-    f_msme = 1.0 if "msme" in c_size else 0.0
-    f_claims = np.log1p(total_claims) / 10.0
-    f_timeline = max(0.1, 1.0 - (days / 660.0))
-    
     for node in nodes:
         feat = np.zeros(22, dtype=np.float32)
+        # Dimensions 0–17: one-hot node type
         if node in NODE_TYPE_KEYS:
             feat[NODE_TYPE_KEYS[node]] = 1.0
-        feat[18], feat[19], feat[20], feat[21] = f_process, f_msme, f_claims, f_timeline
+        # Dimensions 18–21: case-level context (same value for every node in the graph)
+        feat[18] = feat_is_ppirp
+        feat[19] = feat_is_msme
+        feat[20] = feat_log_claims
+        feat[21] = feat_timeline_urgency
         node_features.append(feat)
     
     x = torch.tensor(np.array(node_features), dtype=torch.float)
@@ -217,54 +226,45 @@ def jitter_case_inputs(case_json: Dict, rng: random.Random) -> Dict:
         Jittered case data
     """
     case = copy.deepcopy(case_json)
-    
-    n2 = find_node(case, ['node_2', 'creditor'])
-    n3 = find_node(case, ['node_3', 'promoter'])
-    n4 = find_node(case, ['node_4', 'timeline'])
-    
-    # Creditor amount jitter
-    fc = get_val(n2.get('financial_creditors'))
+
+    creditor_data = find_node(case, ['node_2', 'creditor'])
+    promoter_data = find_node(case, ['node_3', 'promoter'])
+    timeline_data = find_node(case, ['node_4', 'timeline'])
+
+    # Creditor amount jitter — lognormal so amounts stay positive
+    fc = get_val(creditor_data.get('financial_creditors'))
     if isinstance(fc, list):
         for cred in fc:
             if isinstance(cred, dict):
-                amt = cred.get('amount_crores') or cred.get('amount')
-                amt = safe_float(amt)
+                amt = safe_float(cred.get('amount_crores') or cred.get('amount'))
                 if amt > 0:
-                    # FIX: Use rng instead of np.random
                     mult = float(np.exp(rng.gauss(0.0, 0.20)))
-                    new_amt = max(0.0, amt * mult)
-                    if 'amount_crores' in cred:
-                        cred['amount_crores'] = new_amt
-                    else:
-                        cred['amount_crores'] = new_amt
-    
-    # CoC share jitter
-    t = get_val(n2.get('coc_voting_share_top_creditor_pct'))
-    t = safe_float(t)
+                    cred['amount_crores'] = max(0.0, amt * mult)
+
+    # CoC share jitter — additive Gaussian, clipped to valid percentage range
+    t = safe_float(get_val(creditor_data.get('coc_voting_share_top_creditor_pct')))
     if t > 0:
-        # FIX: Use rng instead of np.random
-        t2 = float(np.clip(t + rng.gauss(0.0, 4.0), 0.0, 100.0))
-        n2['coc_voting_share_top_creditor_pct'] = {'value': t2, 'confidence': 1.0}
-    
-    # Days jitter
-    d = safe_float(get_val(n4.get('total_days_in_process')))
+        t_jittered = float(np.clip(t + rng.gauss(0.0, 4.0), 0.0, 100.0))
+        creditor_data['coc_voting_share_top_creditor_pct'] = {'value': t_jittered, 'confidence': 1.0}
+
+    # Days jitter — additive Gaussian, clipped to plausible IBC range [30, 1200]
+    d = safe_float(get_val(timeline_data.get('total_days_in_process')))
     if d == 0:
-        d = 400.0
-    # FIX: Use rng instead of np.random
-    d2 = float(np.clip(d + rng.gauss(0.0, 25.0), 30.0, 1200.0))
-    n4['total_days_in_process'] = {'value': d2, 'confidence': 1.0}
-    
-    # Promoter cooperation flip
-    coop = get_val(n3.get('promoter_cooperating_with_rp'))
+        d = DEFAULT_DAYS_MISSING
+    d_jittered = float(np.clip(d + rng.gauss(0.0, 25.0), 30.0, 1200.0))
+    timeline_data['total_days_in_process'] = {'value': d_jittered, 'confidence': 1.0}
+
+    # Promoter cooperation flip — small probability to simulate extraction uncertainty
+    coop = get_val(promoter_data.get('promoter_cooperating_with_rp'))
     if coop is not None and rng.random() < 0.03:
         new_coop = not coop if isinstance(coop, bool) else False
-        n3['promoter_cooperating_with_rp'] = {'value': new_coop, 'confidence': 0.8}
-    
-    # 29A ineligibility flip
-    ineligible = get_val(n3.get('promoter_is_section_29a_ineligible'))
+        promoter_data['promoter_cooperating_with_rp'] = {'value': new_coop, 'confidence': 0.8}
+
+    # 29A ineligibility flip — lower flip rate as this is more stable/verifiable
+    ineligible = get_val(promoter_data.get('promoter_is_section_29a_ineligible'))
     if ineligible is not None and rng.random() < 0.02:
         new_ineligible = not ineligible if isinstance(ineligible, bool) else False
-        n3['promoter_is_section_29a_ineligible'] = {'value': new_ineligible, 'confidence': 0.8}
+        promoter_data['promoter_is_section_29a_ineligible'] = {'value': new_ineligible, 'confidence': 0.8}
     
     return case
 
@@ -327,11 +327,10 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
     
-    # Load model - FIX: Device placement before loading weights
     print(f"Loading model from {args.model}...")
     model = load_model(
         model_path=args.model,
-        input_dim=22,
+        input_dim=model_config.input_dim_ibc,
         hidden_dim=model_config.hidden_dim,
         num_classes=model_config.num_classes,
         device=device

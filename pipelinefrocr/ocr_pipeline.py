@@ -31,9 +31,11 @@ from PIL import Image
 
 @dataclass
 class Config:
-    input_folder: str = r"D:\HLJ\ibcprediction\nclt_judgments"
-    output_folder: str = r"D:\HLJ\ibcprediction\pipelinefrocr\ocroutput"
-    db_path: str = "./progress.db"
+    # Default paths relative to the project root.
+    # Override via CLI flags (--input / --output) or by passing args at runtime.
+    input_folder: str = "./data/nclt_judgments"
+    output_folder: str = "./data/ocroutput"
+    db_path: str = "./data/ocr_progress.db"
     
     # Pipeline settings
     batch_size: int = 16

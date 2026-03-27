@@ -64,7 +64,7 @@ def convert_command(args):
 
 def scrape_command(args):
     """Run web scraper."""
-    from src.data.scraper import main
+    from datascraper.scraper import main
     sys.argv = ['scraper']
     if args.start:
         sys.argv.extend(['--start', str(args.start)])

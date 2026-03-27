@@ -131,9 +131,10 @@ dmypy.json
 *.pkl
 *.pickle
 
-# Data directories
+# Data directories (but NOT src/data/ which is Python source code)
 data/
 datasets/
+!src/data/
 nclt_judgments/
 ocroutput/
 extracted_json/
